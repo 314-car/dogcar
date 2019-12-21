@@ -1,0 +1,498 @@
+
+#include <reg52.h> //51头文件
+#include <intrins.h>   //包含nop等系统函数
+#include <QXA51.h>//QX-A51智能小车配置文件
+#include "Delay.h"
+#include "Servo.h"
+
+unsigned char pwm_left_val = 100;//左电机占空比值 取值范围0-170，0最快
+unsigned char pwm_right_val = 100;//右电机占空比值取值范围0-170 ,0最快
+unsigned char pwm_t;//周期
+unsigned char control=0X01;//车运动控制全局变量，默认开机为停车状态
+unsigned char LR_flag, RR_flag;//左右转执行次数标志位
+/******************************
+超声波定义
+*******************************/
+sbit RX = P2^0;//ECHO超声波模块回响端
+sbit TX = P2^1;//TRIG超声波模块触发端
+unsigned int  time = 0;//传输时间
+unsigned long S = 0;//距离
+bit      flag = 0;//超出测量范围标志位
+/******************************
+舵机定义
+*******************************/
+unsigned char count=0;
+int LeftDistance = 0, RightDistance = 0, FrontDistance = 0; 
+unsigned long ultrasonic[5] = {0};
+	
+/*小车前进*/
+void forward()
+{
+	left_motor_go; //左电机前进
+	right_motor_go; //右电机前进
+}
+/*小车左转*/
+void left_run()
+{
+	left_motor_stops; //左电机停止
+	right_motor_go; //右电机前进	
+}
+/*小车右转*/
+void right_run()
+{
+	right_motor_stops;//右电机停止
+	left_motor_go;    //左电机前进
+}
+
+/*PWM控制使能 小车后退*/
+void backward()
+{
+	left_motor_back; //左电机后退
+	right_motor_back; //右电机后退	
+}
+/*PWM控制使能 小车高速右转*/
+void right_rapidly()
+{
+	left_motor_go;
+	right_motor_back;	
+}
+/*小车高速左转*/
+void left_rapidly()
+{
+	right_motor_go;
+	left_motor_back;	
+}
+//小车停车
+void stop()
+{
+		left_motor_stops; //左电机后退
+	right_motor_stops; //右电机后退	
+}
+
+
+void keyscan()
+{
+	for(;;)	//死循环
+	{
+		if(key_s2 == 0)// 实时检测S2按键是否被按下
+		{
+			delay(5); //软件消抖
+			if(key_s2 == 0)//再检测S2是否被按下
+			{
+				while(!key_s2);//松手检测
+				beep = 0;	//使能有源蜂鸣器
+				delay(200);//200毫秒延时
+				beep = 1;	//关闭有源蜂鸣器
+				break;		//退出FOR死循环
+			}
+		}
+	}	
+}
+
+//初始化
+void Init(void)
+{
+   	SCON |= 0x50; 	// SCON: 模式1, 8-bit UART, 使能接收
+	T2CON |= 0x34; //设置定时器2为串口波特率发生器并启动定时器2
+	TL2 = RCAP2L = (65536-(FOSC/32/BAUD)); //设置波特率
+	TH2 = RCAP2H = (65536-(FOSC/32/BAUD)) >> 8;
+	ES= 1; 			//打开串口中断
+
+	TMOD |= 0x01;//定时器0工作模块1,16位定时模式。T0用测ECH0脉冲长度
+	TH0 = 0;
+	TL0 = 0;//T0,16位定时计数用于记录ECHO高电平时间
+	ET0 = 1;//允许定时器0中断
+
+	TMOD |= 0x20;	//定时器1，8位自动重装模块
+	TH1 = 220;     
+    TL1 = 220;	   //11.0592M晶振下占空比最大比值是256,输出100HZ
+	TR1 = 1;//启动定时器1
+	ET1 = 1;//允许定时器1中断
+	EA = 0;	    //关总中断
+	ServoFront();
+	EA = 1;	    //开总中断
+}
+
+/**************************************************
+超声波程序
+***************************************************/
+void  StartModule() 		         //启动超声波模块
+{
+	  TX=1;			                     //启动一次模块
+      Delay10us(2);
+	  TX=0;
+}
+
+/*计算超声波所测距离*/
+void Conut(void)
+{
+	time=TH0*256+TL0;
+	TH0=0;
+	TL0=0;
+	
+	S=(float)(time*1.085)*0.17;     //算出来是MM
+	if((S>=7000)||flag==1) //超出测量范围
+	{	 
+		flag=0;
+	}
+}
+
+//冒泡排序
+void bubble(unsigned long *a, int n) /*定义两个参数：数组首地址与数组大小*/
+
+{
+	int i,j,temp;	
+	for(i = 0;i < n-1; i++)	
+	{	
+		for(j = i + 1; j < n; j++) /*注意循环的上下限*/
+		{
+			if(a[i] > a[j])
+			{
+				temp = a[i];		
+				a[i] = a[j];		
+				a[j] = temp;			
+			}
+		}
+	}
+
+}
+
+/*超声波避障*/
+//void	Avoid()
+//{
+//	if(S < 400)//设置避障距离 ，单位毫米	刹车距离
+//	{
+//		stop();//停车
+//		backward();//后退
+//		delay(100);//后退时间越长、距离越远。后退是为了留出车辆转向的空间
+//		do{
+//			left_rapidly();//高速左转
+//			delay(90);//时间越长 转向角度越大，与实际行驶环境有关
+//			stop();//停车
+//			delay(100);//时间越长 停止时间越久长
+//
+//			StartModule();	//启动模块测距，再次判断是否
+//			while(!RX);		//当RX（ECHO信号回响）为零时等待
+//			TR0=1;			    //开启计数
+//			while(RX);			//当RX为1计数并等待
+//			TR0=0;				//关闭计数
+//			Conut();			//计算距离
+//			}while(S < 280);//判断前面障碍物距离
+//	}
+//	else
+//	{
+//		forward();//前进
+//	}	
+//}
+
+
+//黑线寻迹
+void BlackLine()
+{
+		//为0 没有识别到黑线 为1识别到黑线
+	if(left_led1 == 1 && right_led1 == 1)//左右寻迹探头识别到黑线
+	{
+		forward();//前进
+	}
+	else
+	{
+		if(left_led1 == 1 && right_led1 == 0)//小车右边出线，左转修正
+		{
+			left_run();//左转
+		}
+		if(left_led1 == 0 && right_led1 == 1)//小车左边出线，右转修正
+		{
+			right_run();//右转
+		}
+//		if(left_led1 == 0 && right_led1 == 0)//左右寻迹探头都没识别到黑线
+//		{
+//			backward();//后退
+//		}		
+	}	
+}
+
+//红外避障
+void IRAvoid()
+{
+		//为0 识别障碍物 为1没有识别到障碍物
+		if(left_led2 == 1 && right_led2 == 1)//左右都没识别到障碍物
+		{
+			pwm_left_val = 110;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 110;//右电机占空比值取值范围0-170 ,0最快
+			forward();//前进
+			LR_flag = RR_flag = 0;
+		}
+		if(left_led2 == 1 && right_led2 == 0)//小车右侧识别到障碍物，左转躲避
+		{
+			pwm_left_val = 160;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 70;//右电机占空比值取值范围0-170 ,0最快
+			left_run();//左转
+			delay(40);//左转40毫秒（实现左小弯转）
+			LR_flag++;
+			RR_flag = 0;
+		}
+		if(left_led2 == 0 && right_led2 == 1)//小车左侧识别到障碍物，右转躲避
+		{
+			pwm_left_val = 70;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 160;//右电机占空比值取值范围0-170 ,0最快
+			right_run();//右转
+			delay(40);//右转40毫秒（实现右小弯转）'
+			RR_flag++;
+			LR_flag = 0;
+		}
+		if(left_led2 == 0 && right_led2 == 0) //小车左右两侧都识别到障碍物，后退掉头
+		{
+			pwm_left_val = 100;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 100;//右电机占空比值取值范围0-170 ,0最快	
+			backward();//后退
+			delay(100);//后退的时间影响后退的距离。后退时间越长、后退距离越远。
+			pwm_left_val = 120;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 120;//右电机占空比值取值范围0-170 ,0最快
+			right_rapidly();//高速右转
+			delay(180);//延时时间越长，转向角度越大。
+			LR_flag = RR_flag = 0;	
+		}
+		if((LR_flag>3) || (RR_flag>3))		
+		{
+			pwm_left_val = 100;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 100;//右电机占空比值取值范围0-170 ,0最快	
+			backward();//后退
+			delay(100);//后退的时间影响后退的距离。后退时间越长、后退距离越远。
+			pwm_left_val = 120;//左电机占空比值 取值范围0-170，0最快
+			pwm_right_val = 120;//右电机占空比值取值范围0-170 ,0最快
+			right_rapidly();//高速右转
+			delay(180);//延时时间越长，转向角度越大。
+			LR_flag = RR_flag = 0;	
+		}		
+}
+
+//超声波避障
+//void Ultrasonic()
+//{
+//	StartModule();	//启动模块测距
+//	while(!RX);		//当RX（ECHO信号回响）为零时等待
+//	TR0=1;			    //开启计数
+//	while(RX);			//当RX为1计数并等待
+//	TR0=0;				//关闭计数
+//	Conut();			//计算距离
+//	Avoid();			//避障
+//	delay(65);			//测试周期不低于60MS	
+//}
+
+//红外物体跟随
+void IRTracking()
+{
+	unsigned int i;
+	StartModule();	//启动模块测距
+	while(!RX);		//当RX（ECHO信号回响）为零时等待
+	TR0=1;			    //开启计数
+	while(RX);			//当RX为1计数并等待
+	TR0=0;				//关闭计数
+	Conut();			//计算距离
+	if(S < 120)//设置避障距离（单位毫米）
+	{
+		beep = 0;//使能蜂鸣器
+		do{
+			stop();	 //停车
+			delay(200);//停车时间
+
+			 StartModule();	//启动模块测距
+			 while(!RX);		//当RX（ECHO信号回响）为零时等待
+			 TR0=1;			    //开启计数
+			 while(RX);			//当RX为1计数并等待
+			 TR0=0;				//关闭计数
+		     Conut();			//计算距离
+			}while(S < 120); //回到黑线上则退出，否则继续原地转向寻找黑线
+		beep = 1;//关闭蜂鸣器
+	}
+	for(i=0; i<650; i++)  //超声波每次测距间隔不低于65ms
+	{
+			//为0 识别障碍物 为1没有识别到障碍物
+		if(left_led2 == 0 && right_led2 == 0)//左右识别到障碍物，前进跟随
+		{
+			forward();//前进
+		}
+		if(left_led2 == 1 && right_led2 == 0)//小车右侧识别到障碍物，右转跟随
+		{
+			right_run();//右转
+		}
+		if(left_led2 == 0 && right_led2 == 1)//小车左侧识别到障碍物，左转跟随
+		{
+			left_run();//左转
+		}
+	}
+}
+//贴边行驶
+void Revolve()
+{
+		//为0 识别障碍物 为1没有识别到障碍物
+		if(left_led2 == 1 && right_led2 == 1)//左右都没识别到障碍物
+		{
+			forward();//前进
+		}
+		if(left_led2 == 1 && right_led2 == 0)//小车右侧识别到障碍物，左转躲避
+		{
+			left_run();//左转
+		}
+		if(left_led2 == 0 && right_led2 == 1)//小车左侧识别到障碍物，右转躲避
+		{
+			right_run();//右转
+		}
+}
+
+//超声波舵机云台避障
+unsigned long Distance(void)
+{
+	unsigned char num = 0;
+	unsigned long Distance = 0;
+	while(num < 5) // 测5次数据
+	{
+		StartModule();	//启动模块测距
+		while(!RX);		//当RX（ECHO信号回响）为零时等待
+		TR0=1;			    //开启计数
+		while(RX);			//当RX为1计数并等待
+		TR0=0;				//关闭计数
+		Conut();			//计算距离
+		ultrasonic[num] = S;
+		num++;
+		delay(65);			//测试周期不低于60MS
+	}
+//	num = 0;
+	bubble(ultrasonic, 5);
+	Distance = (ultrasonic[1]+ultrasonic[2]+ultrasonic[3])/3; //去掉最大和最小取中间平均值   
+	return Distance;	
+}
+void UltrasonicAvoid()
+{
+	unsigned long Dis = 0;
+	unsigned int j;
+	StartModule();	//启动模块测距
+	while(!RX);		//当RX（ECHO信号回响）为零时等待
+	TR0=1;			    //开启计数
+	while(RX);			//当RX为1计数并等待
+	TR0=0;				//关闭计数
+	Conut();			//计算距离
+	/*超声波云台避障*/
+	if(S < 300)//单位毫米
+	{
+		stop();	 //停车
+		delay(1);//停车时间
+		/*舵机左转测距*/
+		EA = 0;
+		ServoLeft();
+		EA = 1;
+		Dis = Distance();//获取超声波测距距离		
+		LeftDistance = Dis;	
+
+		/*舵机右转测距*/
+		EA = 0;
+		ServoRight();
+		EA = 1;
+		Dis = Distance();//获取超声波测距距离		
+		RightDistance = Dis;
+
+		/*舵机正前方测距*/
+		EA = 0;
+		ServoFront();
+		EA = 1;
+		Dis = Distance();//获取超声波测距距离		
+		FrontDistance = Dis;
+		if((FrontDistance<100) && (LeftDistance<100) && (RightDistance<100))
+		{
+			do{
+				left_rapidly();//原地左转
+				delay(80);
+				/*舵机正前方测距*/
+				EA = 0;
+				ServoFront();
+				EA = 1;
+				Dis = Distance();//获取超声波测距距离		
+				FrontDistance = Dis;		
+			}while(FrontDistance < 200);
+		}else if((FrontDistance>LeftDistance) && (FrontDistance>RightDistance))
+		{
+			forward();	
+		}else if(LeftDistance > RightDistance)
+		{	
+			left_rapidly();//
+			delay(150);	
+		}else
+		{
+			right_rapidly();//右转
+			delay(150);	
+		}	
+	}else
+	{
+		for(j=0; j<650; j++)  //超声波每次测距间隔不低于65ms
+			IRAvoid();//红外避障		
+	}
+
+}
+void main()
+{
+	keyscan();//等待按下S2启动小车
+	delay(1000);//延时1秒
+	Init();//定时器、串口初始化
+	while(1)
+	{
+		if(control>0X17)//如果成立，则表示接收的命令不在运行命令内
+	   {
+	   	stop();	//  停车 
+	   }
+		switch(control)
+		{
+			case 0X02:	forward();			break;	//前进
+			case 0X03:	backward();			break;	//后退
+			case 0X04:	left_run();			break;	//左转
+			case 0X05:	right_run();		break;//右转
+			case 0X01:	stop();				break;//停车
+			case 0X06:	left_rapidly();		break;//左旋转
+			case 0X07:	right_rapidly();	break;//右旋转
+			case 0X08:	beep = 0;			break;//鸣笛
+			case 0X09:	beep = 1;			break;//停止鸣笛
+
+			case 0X11:	UltrasonicAvoid();		break;//超声波避障
+			case 0X12:	BlackLine();		break;//黑线寻迹
+			case 0X13:	IRAvoid();			break;//红外避障
+			case 0X15:	IRTracking();		break;//红外-跟随物体
+			case 0X16:	Revolve();			break;//贴边行驶
+		}
+	}
+}
+
+//定时器0中断
+void timer0() interrupt 1
+{
+	flag=1;							 //中断溢出标志					 
+}
+
+void timer1() interrupt 3 		 //T1中断用来计数器溢出
+{
+    pwm_t++;//周期计时加
+	if(pwm_t == 255)
+		pwm_t = EN1 = EN2 = 0;
+	if(pwm_left_val == pwm_t)//左电机占空比	
+		EN1 = 1;		
+	if(pwm_right_val == pwm_t)//右电机占空比
+		EN2 = 1;			 
+}
+ /******************************************************************/
+/* 串口中断程序*/
+/******************************************************************/
+void UART_SER () interrupt 4
+{
+	unsigned char n; 	//定义临时变量
+
+	if(RI) 		//判断是接收中断产生
+	{
+		RI=0; 	//标志位清零
+		n=SBUF; //读入缓冲区的值
+
+		control=n;
+		if((n >= 51) && (n <= 150))//左电机调速0~100个档位 手机端软件进行调节
+			pwm_left_val = 170-((n-50)*1.7);	
+		if((n >= 151) && (n <= 250))	  //右电机调速0~100个档位 手机端软件进行调节
+			pwm_right_val = 170-((n-150)*1.7);
+	}
+
+}
